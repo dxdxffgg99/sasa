@@ -1,3 +1,4 @@
 pygame-ce
 opencv-python
 mediapipe
+librosa
