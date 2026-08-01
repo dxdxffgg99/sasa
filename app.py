@@ -73,9 +73,11 @@ notes = [
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption(GAME_CAPTION)
 clock = pygame.time.Clock()
-combo_font = pygame.font.SysFont("consolas", 82, bold=True)
-combo_label_font = pygame.font.SysFont("consolas", 20, bold=True)
-judge_font = pygame.font.SysFont("consolas", 44, bold=True)
+
+FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font.ttf")
+combo_font = pygame.font.Font(FONT_PATH, 82)
+combo_label_font = pygame.font.Font(FONT_PATH, 20)
+judge_font = pygame.font.Font(FONT_PATH, 44)
 
 
 def make_background():
