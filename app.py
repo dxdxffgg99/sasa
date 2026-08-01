@@ -2,12 +2,12 @@ import random
 import sys
 import time
 import json
+import math
 import os
 import cv2
 import mediapipe as mp
 import pygame
 
-# A small buffer keeps audio latency low, which matters for judging.
 pygame.mixer.pre_init(44100, -16, 2, 512)
 pygame.init()
 
@@ -16,6 +16,7 @@ BORDERLESS = True
 FULLSCREEN = False
 WIDTH = 768
 HEIGHT = INFO.current_h if FULLSCREEN else INFO.current_h-50
+SIDE_PANEL_WIDTH = 260
 GAME_CAPTION = "sasa rhythm"
 LANE_COUNT = 4
 LANE_WIDTH = WIDTH // LANE_COUNT
@@ -48,19 +49,32 @@ NOTE_FALL_TIME = 1200
 HOLD_WIDTH = LANE_WIDTH - NOTE_MARGIN * 2 - 10
 HOLD_BODY_ALPHA = 150
 HOLD_HELD_ALPHA = 230
-HOLD_LANE_ALPHA = 80  # the lane stays lit this much while a long note is held
+HOLD_MISSED_ALPHA = 70
+HOLD_LANE_ALPHA = 80
+MISSED_NOTE_COLOR = (110, 110, 120)
 
-PERFECT_WINDOW = 50
-GREAT_WINDOW = 100
-GOOD_WINDOW = 160
+SYNC = 0
+SCORE_P = 1
+SIGMA_EARLY = 60.0
+SIGMA_LATE = 40.0
+GOOD_WINDOW = 40
+THRESHOLD_MARVELOUS = 0.99
+THRESHOLD_PERFECT = 0.85
+THRESHOLD_GREAT = 0.75
+THRESHOLD_GOOD = 0.5
+
 JUDGE_TEXT_TIME = 400
 COMBO_POP_TIME = 130
 JUDGE_COLORS = {
-    "PERFECT": (255, 226, 120),
-    "GREAT": (120, 230, 255),
-    "GOOD": (150, 255, 170),
-    "MISS": (255, 85, 105),
+    "MARVELOUS": (255, 255, 255),
+    "PERFECT": (202, 87, 255),
+    "GREAT": (97, 165, 255),
+    "GOOD": (255, 190, 79),
+    "MISS": (255, 79, 85),
 }
+JUDGE_HISTORY_LENGTH = 8
+PANEL_BG_COLOR = (14, 14, 26, 160)
+PANEL_LABEL_COLOR = (150, 160, 200)
 
 CHART_PATH = sys.argv[1] if len(sys.argv) > 1 else 'game.json'
 
@@ -101,7 +115,7 @@ if AUDIO:
 if FULLSCREEN:
     WINDOW_WIDTH, WINDOW_HEIGHT = INFO.current_w, INFO.current_h
 else:
-    WINDOW_WIDTH, WINDOW_HEIGHT = WIDTH, HEIGHT
+    WINDOW_WIDTH, WINDOW_HEIGHT = WIDTH + SIDE_PANEL_WIDTH * 2, HEIGHT
     os.environ["SDL_VIDEO_CENTERED"] = "1"
 
 window = pygame.display.set_mode(
@@ -117,9 +131,11 @@ pygame.display.set_caption(GAME_CAPTION)
 clock = pygame.time.Clock()
 
 FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font.ttf")
-combo_font = pygame.font.Font(FONT_PATH, 82)
-combo_label_font = pygame.font.Font(FONT_PATH, 20)
 judge_font = pygame.font.Font(FONT_PATH, 44)
+panel_label_font = pygame.font.Font(FONT_PATH, 18)
+panel_score_font = pygame.font.Font(FONT_PATH, 40)
+panel_combo_font = pygame.font.Font(FONT_PATH, 60)
+panel_history_font = pygame.font.Font(FONT_PATH, 24)
 
 
 def make_background():
@@ -147,7 +163,7 @@ def make_lane_flash(color):
     surface = pygame.Surface((LANE_WIDTH, JUDGE_LINE_HEIGHT), pygame.SRCALPHA)
     for y in range(JUDGE_LINE_HEIGHT):
         ratio = y / JUDGE_LINE_HEIGHT
-        surface.fill((*color, int(255 * ratio ** 3)), (0, y, LANE_WIDTH, 1))
+        surface.fill((*color, int(255 * ratio ** 4)), (0, y, LANE_WIDTH, 1))
     return surface
 
 
@@ -163,6 +179,17 @@ combo_time = -COMBO_POP_TIME
 hit_errors = []
 judge_text = ""
 judge_time = -JUDGE_TEXT_TIME
+score = 0
+judge_history = []
+
+
+def record_judge(name, now, error=0):
+    """Track score and the left-panel judgement history for any judged hit."""
+    global score
+    score += round(judge_score(error) * 1000)
+    judge_history.append((name, now))
+    if len(judge_history) > JUDGE_HISTORY_LENGTH:
+        judge_history.pop(0)
 
 
 def note_y(note_time, now):
@@ -182,13 +209,24 @@ def draw_note_head(lane, y, color):
     pygame.draw.rect(note_surface, (255, 255, 255), body.inflate(0, -NOTE_HEIGHT + 6), border_radius=3)
 
 
+def judge_score(error):
+    """Score(dt): a Gaussian centered on Sync, asymmetric between early/late hits."""
+    diff = error - SYNC
+    sigma = SIGMA_EARLY if diff < 0 else SIGMA_LATE
+    return math.exp(-SCORE_P * diff ** 2 / (2 * sigma ** 2))
+
+
 def rate(error):
-    diff = abs(error)
-    if diff <= PERFECT_WINDOW:
+    s = judge_score(error)
+    if s >= THRESHOLD_MARVELOUS:
+        return "MARVELOUS"
+    elif s >= THRESHOLD_PERFECT:
         return "PERFECT"
-    elif diff <= GREAT_WINDOW:
+    elif s >= THRESHOLD_GREAT:
         return "GREAT"
-    return "GOOD"
+    elif s >= THRESHOLD_GOOD:
+        return "GOOD"
+    return "MISS"
 
 
 def press_lane(lane, now):
@@ -212,16 +250,19 @@ def press_lane(lane, now):
 
 
 def release_lane(lane, now):
-    """Let go of a held note. Returns the judgement name, or None if nothing was held."""
+    """Let go of a held note. Returns the judgement name and error, or (None, 0) if nothing was held."""
     for note in notes:
         if note["state"] != "hold" or note["lane"] != lane:
             continue
-        note["state"] = "done"
-        # Letting go just before the tail still counts; anything earlier drops it.
+        # Letting go just before the tail still counts; anything earlier drops it,
+        # but the body keeps falling through instead of vanishing on the spot.
         if now >= note["time"] + note["len"] - GOOD_WINDOW:
-            return rate(now - note["time"] - note["len"])
-        return "MISS"
-    return None
+            note["state"] = "done"
+            error = now - note["time"] - note["len"]
+            return rate(error), error
+        note["state"] = "missed"
+        return "MISS", 0
+    return None, 0
 
 
 running = True
@@ -253,42 +294,57 @@ while running:
                 lane = KEY_MAP[event.key]
                 lane_alpha[lane] = ANIMATION_INIT_ALPHA
                 result, error = press_lane(lane, now)
-                if result is not None:
+                if result == "MISS":
+                    hit_errors.append(error)
+                    combo = 0
+                    judge_text = "MISS"
+                    judge_time = now
+                    record_judge(result, now, error)
+                elif result is not None:
                     hit_errors.append(error)
                     combo += 1
                     combo_time = now
                     judge_text = result
                     judge_time = now
                     spark_time[lane] = now
+                    record_judge(result, now, error)
         elif event.type == pygame.KEYUP and event.key in KEY_MAP:
             lane = KEY_MAP[event.key]
-            result = release_lane(lane, now)
+            result, error = release_lane(lane, now)
             if result == "MISS":
                 combo = 0
                 judge_text = "MISS"
                 judge_time = now
+                record_judge(result, now, error)
             elif result is not None:
                 combo += 1
                 combo_time = now
                 judge_text = result
                 judge_time = now
                 spark_time[lane] = now
+                record_judge(result, now, error)
 
     for note in notes:
         if note["state"] == "wait" and now - note["time"] > GOOD_WINDOW:
-            note["state"] = "done"
+            # A missed long note keeps falling through instead of disappearing; taps just vanish.
+            note["state"] = "missed" if note["len"] > 0 else "done"
             combo = 0
             judge_text = "MISS"
             judge_time = now
+            record_judge("MISS", now, now - note["time"])
+        elif note["state"] == "missed":
+            if note_y(note["time"] + note["len"], now) > HEIGHT:
+                note["state"] = "done"
         elif note["state"] == "hold":
             # Held all the way to the tail: complete it without needing a release.
             if now >= note["time"] + note["len"]:
                 note["state"] = "done"
                 combo += 1
                 combo_time = now
-                judge_text = "PERFECT"
+                judge_text = "MARVELOUS"
                 judge_time = now
                 spark_time[note["lane"]] = now
+                record_judge("MARVELOUS", now)
             else:
                 # Keep the lane lit for as long as the key is down.
                 lane_alpha[note["lane"]] = max(lane_alpha[note["lane"]], HOLD_LANE_ALPHA)
@@ -305,24 +361,31 @@ while running:
     for note in notes:
         if note["state"] == "done":
             continue
-        color = LANE_COLORS[note["lane"]]
+        color = MISSED_NOTE_COLOR if note["state"] == "missed" else LANE_COLORS[note["lane"]]
         head_y = note_y(note["time"], now)
 
         if note["len"] > 0:
             tail_y = note_y(note["time"] + note["len"], now)
-            if tail_y < 0:
+            if head_y < 0:
                 continue
             # While held, the body is consumed by the judge line instead of falling past it.
+            # A missed hold keeps falling straight through the line instead of being clipped.
             if note["state"] == "hold":
                 head_y = min(head_y, JUDGE_LINE_HEIGHT)
-            alpha = HOLD_HELD_ALPHA if note["state"] == "hold" else HOLD_BODY_ALPHA
+            visible_tail_y = max(0, tail_y)
+            if note["state"] == "hold":
+                alpha = HOLD_HELD_ALPHA
+            elif note["state"] == "missed":
+                alpha = HOLD_MISSED_ALPHA
+            else:
+                alpha = HOLD_BODY_ALPHA
             pygame.draw.rect(note_surface, (*color, alpha), pygame.Rect(
                 note["lane"] * LANE_WIDTH + (LANE_WIDTH - HOLD_WIDTH) // 2,
-                tail_y,
+                visible_tail_y,
                 HOLD_WIDTH,
-                max(0, head_y - tail_y),
+                max(0, head_y - visible_tail_y),
             ), border_radius=4)
-            draw_note_head(note["lane"], tail_y, color)
+            draw_note_head(note["lane"], visible_tail_y, color)
         elif head_y < 0:
             continue
 
@@ -350,18 +413,6 @@ while running:
         screen.blit(glow, (0, JUDGE_LINE_HEIGHT - offset))
     pygame.draw.line(screen, JUDGE_LINE_COLOR, (0, JUDGE_LINE_HEIGHT), (WIDTH, JUDGE_LINE_HEIGHT), width=3)
 
-    if combo > 0:
-        combo_image = combo_font.render(str(combo), True, (255, 255, 255))
-        pop = max(0.0, 1 - (now - combo_time) / COMBO_POP_TIME)
-        scale = 1 + 0.22 * pop
-        combo_image = pygame.transform.smoothscale(
-            combo_image, (int(combo_image.get_width() * scale), int(combo_image.get_height() * scale))
-        )
-        center = (WIDTH // 2, JUDGE_LINE_HEIGHT - 290)
-        screen.blit(combo_image, combo_image.get_rect(center=center))
-        label_image = combo_label_font.render("COMBO", True, (150, 160, 200))
-        screen.blit(label_image, label_image.get_rect(center=(center[0], center[1] + 58)))
-
     elapsed = now - judge_time
     if elapsed < JUDGE_TEXT_TIME:
         ratio = elapsed / JUDGE_TEXT_TIME
@@ -372,11 +423,59 @@ while running:
     if PLAY_X or PLAY_Y:
         window.fill((0, 0, 0))
     window.blit(screen, (PLAY_X, PLAY_Y))
+
+    # Left panel: judgement info (current + recent history).
+    if PLAY_X > 0:
+        left_panel = pygame.Surface((PLAY_X, HEIGHT), pygame.SRCALPHA)
+        left_panel.fill(PANEL_BG_COLOR)
+        label_image = panel_label_font.render("판정", True, PANEL_LABEL_COLOR)
+        left_panel.blit(label_image, label_image.get_rect(midtop=(PLAY_X // 2, 40)))
+
+        if judge_history:
+            current_name, current_time = judge_history[-1]
+            current_ratio = min(1.0, (now - current_time) / JUDGE_TEXT_TIME)
+            current_image = judge_font.render(current_name, True, JUDGE_COLORS[current_name])
+            current_image.set_alpha(255 - int(180 * current_ratio ** 2))
+            left_panel.blit(current_image, current_image.get_rect(center=(PLAY_X // 2, 100)))
+
+        history_top = 170
+        for i, (name, hit_time) in enumerate(reversed(judge_history[:-1])):
+            row_image = panel_history_font.render(name, True, JUDGE_COLORS[name])
+            row_image.set_alpha(max(60, 220 - i * 24))
+            left_panel.blit(row_image, row_image.get_rect(midtop=(PLAY_X // 2, history_top + i * 34)))
+
+        window.blit(left_panel, (0, PLAY_Y))
+
+    # Right panel: combo and score.
+    right_panel_x = PLAY_X + WIDTH
+    right_panel_width = WINDOW_WIDTH - right_panel_x
+    if right_panel_width > 0:
+        right_panel = pygame.Surface((right_panel_width, HEIGHT), pygame.SRCALPHA)
+        right_panel.fill(PANEL_BG_COLOR)
+        center_x = right_panel_width // 2
+
+        combo_label_image = panel_label_font.render("COMBO", True, PANEL_LABEL_COLOR)
+        right_panel.blit(combo_label_image, combo_label_image.get_rect(midtop=(center_x, 40)))
+
+        combo_image = panel_combo_font.render(str(combo), True, (255, 255, 255))
+        pop = max(0.0, 1 - (now - combo_time) / COMBO_POP_TIME)
+        scale = 1 + 0.22 * pop
+        combo_image = pygame.transform.smoothscale(
+            combo_image, (int(combo_image.get_width() * scale), int(combo_image.get_height() * scale))
+        )
+        right_panel.blit(combo_image, combo_image.get_rect(center=(center_x, 100)))
+
+        score_label_image = panel_label_font.render("SCORE", True, PANEL_LABEL_COLOR)
+        right_panel.blit(score_label_image, score_label_image.get_rect(midtop=(center_x, 220)))
+        score_image = panel_score_font.render(f"{score:,}", True, (255, 255, 255))
+        right_panel.blit(score_image, score_image.get_rect(midtop=(center_x, 250)))
+
+        window.blit(right_panel, (right_panel_x, PLAY_Y))
+
     pygame.display.flip()
     clock.tick(60)
 pygame.quit()
 
-# Your average timing error is the part of the offset that hardware latency causes.
 if len(hit_errors) >= 10:
     hit_errors.sort()
     median = hit_errors[len(hit_errors) // 2]
