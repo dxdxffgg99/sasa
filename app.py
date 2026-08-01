@@ -1,4 +1,5 @@
 import random
+import sys
 import time
 import json
 import os
@@ -6,11 +7,15 @@ import cv2
 import mediapipe as mp
 import pygame
 
+# A small buffer keeps audio latency low, which matters for judging.
+pygame.mixer.pre_init(44100, -16, 2, 512)
 pygame.init()
 
 INFO = pygame.display.Info()
+BORDERLESS = True
+FULLSCREEN = False
 WIDTH = 768
-HEIGHT = INFO.current_h-50
+HEIGHT = INFO.current_h if FULLSCREEN else INFO.current_h-50
 GAME_CAPTION = "sasa rhythm"
 LANE_COUNT = 4
 LANE_WIDTH = WIDTH // LANE_COUNT
@@ -40,6 +45,11 @@ NOTE_MARGIN = 8
 NOTE_RADIUS = 7
 NOTE_FALL_TIME = 1200
 
+HOLD_WIDTH = LANE_WIDTH - NOTE_MARGIN * 2 - 10
+HOLD_BODY_ALPHA = 150
+HOLD_HELD_ALPHA = 230
+HOLD_LANE_ALPHA = 80  # the lane stays lit this much while a long note is held
+
 PERFECT_WINDOW = 50
 GREAT_WINDOW = 100
 GOOD_WINDOW = 160
@@ -52,8 +62,10 @@ JUDGE_COLORS = {
     "MISS": (255, 85, 105),
 }
 
+CHART_PATH = sys.argv[1] if len(sys.argv) > 1 else 'game.json'
+
 try:
-    with open('game.json', 'r', encoding='utf-8') as file:
+    with open(CHART_PATH, 'r', encoding='utf-8') as file:
         game_file = file.read()
         game = json.loads(game_file)
 
@@ -65,12 +77,42 @@ except Exception as e:
     print(f"{e}")
     exit(1)
 
+# A chart may leave out "len" entirely, in which case every note is a tap.
+hold_lengths = game.get("len") or [0] * len(game["note"])
+
+# state: "wait" -> "hold" (long notes being held) -> "done"
 notes = [
-    {"lane": lane - 1, "time": hit_time, "judged": False}
-    for lane, hit_time in zip(game["note"], game["time"])
+    {"lane": lane - 1, "time": hit_time, "len": hold_len, "state": "wait"}
+    for lane, hit_time, hold_len in zip(game["note"], game["time"], hold_lengths)
 ]
 
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
+# Charts from make_chart.py carry their song; hand-written ones may not.
+AUDIO = game.get("audio")
+LEAD_IN = game.get("lead_in", 0)
+SYNC_OFFSET = game.get("offset", 0)  # raise this if the notes arrive later than the song
+
+if AUDIO:
+    try:
+        pygame.mixer.music.load(AUDIO)
+    except pygame.error as e:
+        print(f"audio load failed: {e}")
+        AUDIO = None
+
+if FULLSCREEN:
+    WINDOW_WIDTH, WINDOW_HEIGHT = INFO.current_w, INFO.current_h
+else:
+    WINDOW_WIDTH, WINDOW_HEIGHT = WIDTH, HEIGHT
+    os.environ["SDL_VIDEO_CENTERED"] = "1"
+
+window = pygame.display.set_mode(
+    (WINDOW_WIDTH, WINDOW_HEIGHT),
+    pygame.NOFRAME if BORDERLESS or FULLSCREEN else 0,
+)
+# The playfield is drawn on its own surface, then centered inside the window.
+screen = pygame.Surface((WIDTH, HEIGHT))
+PLAY_X = (WINDOW_WIDTH - WIDTH) // 2
+PLAY_Y = (WINDOW_HEIGHT - HEIGHT) // 2
+
 pygame.display.set_caption(GAME_CAPTION)
 clock = pygame.time.Clock()
 
@@ -118,26 +160,30 @@ lane_alpha = [0] * LANE_COUNT
 spark_time = [-SPARK_TIME] * LANE_COUNT
 combo = 0
 combo_time = -COMBO_POP_TIME
+hit_errors = []
 judge_text = ""
 judge_time = -JUDGE_TEXT_TIME
 
 
-def judge_lane(lane, now):
-    """Judge the closest unjudged note in `lane`. Returns the judgement name or None."""
-    target = None
-    for note in notes:
-        if note["judged"] or note["lane"] != lane:
-            continue
-        if abs(note["time"] - now) > GOOD_WINDOW:
-            continue
-        if target is None or abs(note["time"] - now) < abs(target["time"] - now):
-            target = note
+def note_y(note_time, now):
+    """Screen height a note of that timestamp sits at right now."""
+    return JUDGE_LINE_HEIGHT * (1 - (note_time - now) / NOTE_FALL_TIME)
 
-    if target is None:
-        return None
 
-    target["judged"] = True
-    diff = abs(target["time"] - now)
+def draw_note_head(lane, y, color):
+    body = pygame.Rect(
+        lane * LANE_WIDTH + NOTE_MARGIN,
+        y - NOTE_HEIGHT // 2,
+        LANE_WIDTH - NOTE_MARGIN * 2,
+        NOTE_HEIGHT,
+    )
+    pygame.draw.rect(note_surface, (*color, 70), body.inflate(10, 10), border_radius=NOTE_RADIUS + 3)
+    pygame.draw.rect(note_surface, color, body, border_radius=NOTE_RADIUS)
+    pygame.draw.rect(note_surface, (255, 255, 255), body.inflate(0, -NOTE_HEIGHT + 6), border_radius=3)
+
+
+def rate(error):
+    diff = abs(error)
     if diff <= PERFECT_WINDOW:
         return "PERFECT"
     elif diff <= GREAT_WINDOW:
@@ -145,11 +191,57 @@ def judge_lane(lane, now):
     return "GOOD"
 
 
+def press_lane(lane, now):
+    """Hit the closest waiting note in `lane`. Returns the judgement name or None."""
+    target = None
+    for note in notes:
+        if note["state"] != "wait" or note["lane"] != lane:
+            continue
+        if abs(note["time"] - now) > GOOD_WINDOW:
+            continue
+        if target is None or abs(note["time"] - now) < abs(target["time"] - now):
+            target = note
+
+    if target is None:
+        return None, 0
+
+    error = now - target["time"]  # positive means the key was pressed late
+    # A long note stays alive until its tail is reached or the key is let go.
+    target["state"] = "hold" if target["len"] > 0 else "done"
+    return rate(error), error
+
+
+def release_lane(lane, now):
+    """Let go of a held note. Returns the judgement name, or None if nothing was held."""
+    for note in notes:
+        if note["state"] != "hold" or note["lane"] != lane:
+            continue
+        note["state"] = "done"
+        # Letting go just before the tail still counts; anything earlier drops it.
+        if now >= note["time"] + note["len"] - GOOD_WINDOW:
+            return rate(now - note["time"] - note["len"])
+        return "MISS"
+    return None
+
+
 running = True
+music_started = False
 start_ticks = pygame.time.get_ticks()
 
 while running:
-    now = pygame.time.get_ticks() - start_ticks
+    elapsed = pygame.time.get_ticks() - start_ticks
+
+    if AUDIO and not music_started and elapsed >= LEAD_IN:
+        pygame.mixer.music.play()
+        music_started = True
+
+    # Once the song is playing it owns the clock, so drawing can never drift from it.
+    now = elapsed
+    if music_started:
+        position = pygame.mixer.music.get_pos()
+        if position >= 0:
+            now = position + LEAD_IN
+    now += SYNC_OFFSET
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -160,20 +252,46 @@ while running:
             elif event.key in KEY_MAP:
                 lane = KEY_MAP[event.key]
                 lane_alpha[lane] = ANIMATION_INIT_ALPHA
-                result = judge_lane(lane, now)
+                result, error = press_lane(lane, now)
                 if result is not None:
+                    hit_errors.append(error)
                     combo += 1
                     combo_time = now
                     judge_text = result
                     judge_time = now
                     spark_time[lane] = now
+        elif event.type == pygame.KEYUP and event.key in KEY_MAP:
+            lane = KEY_MAP[event.key]
+            result = release_lane(lane, now)
+            if result == "MISS":
+                combo = 0
+                judge_text = "MISS"
+                judge_time = now
+            elif result is not None:
+                combo += 1
+                combo_time = now
+                judge_text = result
+                judge_time = now
+                spark_time[lane] = now
 
     for note in notes:
-        if not note["judged"] and now - note["time"] > GOOD_WINDOW:
-            note["judged"] = True
+        if note["state"] == "wait" and now - note["time"] > GOOD_WINDOW:
+            note["state"] = "done"
             combo = 0
             judge_text = "MISS"
             judge_time = now
+        elif note["state"] == "hold":
+            # Held all the way to the tail: complete it without needing a release.
+            if now >= note["time"] + note["len"]:
+                note["state"] = "done"
+                combo += 1
+                combo_time = now
+                judge_text = "PERFECT"
+                judge_time = now
+                spark_time[note["lane"]] = now
+            else:
+                # Keep the lane lit for as long as the key is down.
+                lane_alpha[note["lane"]] = max(lane_alpha[note["lane"]], HOLD_LANE_ALPHA)
 
     screen.blit(background, (0, 0))
 
@@ -185,30 +303,38 @@ while running:
 
     note_surface.fill((0, 0, 0, 0))
     for note in notes:
-        if note["judged"]:
+        if note["state"] == "done":
             continue
-        progress = 1 - (note["time"] - now) / NOTE_FALL_TIME
-        if progress < 0:
-            continue
-        y = JUDGE_LINE_HEIGHT * progress
         color = LANE_COLORS[note["lane"]]
-        body = pygame.Rect(
-            note["lane"] * LANE_WIDTH + NOTE_MARGIN,
-            y - NOTE_HEIGHT // 2,
-            LANE_WIDTH - NOTE_MARGIN * 2,
-            NOTE_HEIGHT,
-        )
-        pygame.draw.rect(note_surface, (*color, 70), body.inflate(10, 10), border_radius=NOTE_RADIUS + 3)
-        pygame.draw.rect(note_surface, color, body, border_radius=NOTE_RADIUS)
-        pygame.draw.rect(note_surface, (255, 255, 255), body.inflate(0, -NOTE_HEIGHT + 6), border_radius=3)
+        head_y = note_y(note["time"], now)
+
+        if note["len"] > 0:
+            tail_y = note_y(note["time"] + note["len"], now)
+            if tail_y < 0:
+                continue
+            # While held, the body is consumed by the judge line instead of falling past it.
+            if note["state"] == "hold":
+                head_y = min(head_y, JUDGE_LINE_HEIGHT)
+            alpha = HOLD_HELD_ALPHA if note["state"] == "hold" else HOLD_BODY_ALPHA
+            pygame.draw.rect(note_surface, (*color, alpha), pygame.Rect(
+                note["lane"] * LANE_WIDTH + (LANE_WIDTH - HOLD_WIDTH) // 2,
+                tail_y,
+                HOLD_WIDTH,
+                max(0, head_y - tail_y),
+            ), border_radius=4)
+            draw_note_head(note["lane"], tail_y, color)
+        elif head_y < 0:
+            continue
+
+        draw_note_head(note["lane"], head_y, color)
     screen.blit(note_surface, (0, 0))
 
     effect_surface.fill((0, 0, 0, 0))
     for i in range(LANE_COUNT):
-        elapsed = now - spark_time[i]
-        if elapsed >= SPARK_TIME:
+        spark_elapsed = now - spark_time[i]
+        if spark_elapsed >= SPARK_TIME:
             continue
-        ratio = elapsed / SPARK_TIME
+        ratio = spark_elapsed / SPARK_TIME
         pygame.draw.circle(
             effect_surface,
             (*LANE_COLORS[i], int(180 * (1 - ratio))),
@@ -243,6 +369,20 @@ while running:
         judge_image.set_alpha(255 - int(255 * ratio ** 2))
         screen.blit(judge_image, judge_image.get_rect(center=(WIDTH // 2, JUDGE_LINE_HEIGHT - 180 - int(18 * ratio))))
 
+    if PLAY_X or PLAY_Y:
+        window.fill((0, 0, 0))
+    window.blit(screen, (PLAY_X, PLAY_Y))
     pygame.display.flip()
     clock.tick(60)
 pygame.quit()
+
+# Your average timing error is the part of the offset that hardware latency causes.
+if len(hit_errors) >= 10:
+    hit_errors.sort()
+    median = hit_errors[len(hit_errors) // 2]
+    average = sum(hit_errors) / len(hit_errors)
+    print(f"hits: {len(hit_errors)}  median error: {median:+d} ms  average: {average:+.1f} ms")
+    print(f"suggested offset: {SYNC_OFFSET - median} (currently {SYNC_OFFSET})")
+    print("positive error means you pressed late, so the notes were arriving early")
+else:
+    print("play at least 10 notes to get an offset suggestion")
