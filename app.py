@@ -93,6 +93,12 @@ SONG_DIR = os.path.dirname(os.path.abspath(__file__))
 SELECT_ROW_HEIGHT = 86
 SELECT_SCROLL_SPEED = 0.22  # fraction of the remaining distance eaten per frame
 ACCENT_COLOR = (120, 190, 255)
+SELECT_BG_NOTES = 44
+SELECT_BG_SPEED = (30, 95)   # px per second
+SELECT_BG_ALPHA = (7, 44)    # at the middle of the screen, and out at the edges
+SELECT_BG_COLUMNS = 15
+SELECT_BG_HEIGHT = 7
+BEAT_DECAY = 3.0  # how sharply the on-beat flash falls away before the next one
 DIM_TEXT_COLOR = (140, 150, 185)
 END_HANG_TIME = 1500  # ms of empty playfield before the results come up
 DEFAULT_MIXER_RATE = 44100
@@ -170,6 +176,7 @@ menu_background = make_gradient((WINDOW_WIDTH, WINDOW_HEIGHT), BG_TOP_COLOR, BG_
 lane_flashes = [make_lane_flash(color) for color in LANE_COLORS]
 note_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 effect_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+menu_effect_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
 
 
 def load_json_chart(path):
@@ -211,18 +218,83 @@ def find_charts(directory):
     return sorted(found, key=lambda chart: chart["title"].lower())
 
 
+def menu_note_alpha(x, width):
+    """Dim in the middle, bright at the edges.
+
+    The song list lives in the middle of the screen, so the drift stays out at
+    the sides where it reads as motion instead of as clutter behind the text.
+    """
+    away = min(1.0, abs(x + width / 2 - WINDOW_WIDTH / 2) / (WINDOW_WIDTH / 2))
+    low, high = SELECT_BG_ALPHA
+    return int(low + (high - low) * away ** 1.5)
+
+
+def menu_note_column():
+    """A lane to fall down, so the drift reads as notes rather than as debris."""
+    span = WINDOW_WIDTH / SELECT_BG_COLUMNS
+    width = int(span * 0.5)
+    x = random.randrange(SELECT_BG_COLUMNS) * span + (span - width) / 2
+    return x, width
+
+
+def make_menu_notes():
+    """Faint notes drifting down behind the song list, so the menu is not still."""
+    notes = []
+    for _ in range(SELECT_BG_NOTES):
+        x, width = menu_note_column()
+        notes.append({
+            "x": x,
+            # Spread them above and across the screen so the very first frame
+            # already looks like a stream rather than a row dropping in.
+            "y": random.uniform(-WINDOW_HEIGHT, WINDOW_HEIGHT),
+            "speed": random.uniform(*SELECT_BG_SPEED),
+            "alpha": menu_note_alpha(x, width),
+            "width": width,
+            "color": random.choice(LANE_COLORS),
+        })
+    return notes
+
+
+def draw_menu_notes(surface, notes, dt):
+    menu_effect_surface.fill((0, 0, 0, 0))
+    for note in notes:
+        note["y"] += note["speed"] * dt
+        if note["y"] > WINDOW_HEIGHT:
+            note["y"] = -SELECT_BG_HEIGHT
+            note["x"], note["width"] = menu_note_column()
+            note["alpha"] = menu_note_alpha(note["x"], note["width"])
+            note["color"] = random.choice(LANE_COLORS)
+        pygame.draw.rect(
+            menu_effect_surface, (*note["color"], note["alpha"]),
+            pygame.Rect(int(note["x"]), int(note["y"]), note["width"], SELECT_BG_HEIGHT),
+            border_radius=3,
+        )
+    surface.blit(menu_effect_surface, (0, 0))
+
+
+def beat_pulse(elapsed, bpm):
+    """1.0 on the beat, falling to 0 by the next one, at the song's own tempo.
+
+    The menu breathing at the highlighted chart's bpm says how fast the song is
+    before the player commits to it -- the number alone does not land the same way.
+    """
+    beat_ms = 60000 / (bpm or 120)
+    return (1 - (elapsed % beat_ms) / beat_ms) ** BEAT_DECAY
+
+
 def draw_footer(surface, text):
     image = footer_font.render(text, True, DIM_TEXT_COLOR)
     surface.blit(image, image.get_rect(midbottom=(WINDOW_WIDTH // 2, WINDOW_HEIGHT - 34)))
 
 
-def draw_song_row(surface, chart, rect, selected):
+def draw_song_row(surface, chart, rect, selected, pulse=0.0):
     """One entry of the song list: title, artist, and the chart's numbers."""
     if selected:
         panel = pygame.Surface(rect.size, pygame.SRCALPHA)
-        panel.fill((*ACCENT_COLOR, 26))
+        panel.fill((*ACCENT_COLOR, 26 + int(20 * pulse)))
         surface.blit(panel, rect.topleft)
-        pygame.draw.rect(surface, (*ACCENT_COLOR, 255), pygame.Rect(rect.left, rect.top, 5, rect.height))
+        bar = 5 + int(4 * pulse)
+        pygame.draw.rect(surface, ACCENT_COLOR, pygame.Rect(rect.left, rect.top, bar, rect.height))
 
     text_x = rect.left + 34
     title_color = (255, 255, 255) if selected else (190, 198, 225)
@@ -247,6 +319,10 @@ def draw_song_row(surface, chart, rect, selected):
 def song_select(charts, index=0):
     """Pick a chart. Returns (index, chart) or (index, None) when quitting."""
     scroll = float(index)
+    notes = make_menu_notes()
+    # Anchored at the moment the highlight moved, so each song's pulse starts
+    # on its own downbeat instead of inheriting the previous song's phase.
+    beat_anchor = pygame.time.get_ticks()
     list_left = max(40, (WINDOW_WIDTH - 900) // 2)
     list_width = min(900, WINDOW_WIDTH - 80)
     list_top = 190
@@ -263,8 +339,10 @@ def song_select(charts, index=0):
                 return index, None
             elif event.key in (pygame.K_UP, pygame.K_LEFT):
                 index = (index - 1) % len(charts)
+                beat_anchor = pygame.time.get_ticks()
             elif event.key in (pygame.K_DOWN, pygame.K_RIGHT):
                 index = (index + 1) % len(charts)
+                beat_anchor = pygame.time.get_ticks()
             elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
                 return index, charts[index]
 
@@ -275,21 +353,30 @@ def song_select(charts, index=0):
         if abs(target - scroll) < 0.01:
             scroll = float(target)
 
+        pulse = beat_pulse(pygame.time.get_ticks() - beat_anchor, charts[index]["bpm"])
+
         window.blit(menu_background, (0, 0))
+        draw_menu_notes(window, notes, clock.get_time() / 1000)
 
         heading = heading_font.render("sasa", True, (255, 255, 255))
         window.blit(heading, (list_left, 74))
         count = meta_font.render(f"{len(charts)}곡", True, DIM_TEXT_COLOR)
         window.blit(count, count.get_rect(bottomright=(list_left + list_width, 74 + heading.get_height() - 6)))
-        pygame.draw.line(window, SEPERATE_LINE_COLOR, (list_left, list_top - 22),
-                         (list_left + list_width, list_top - 22), width=2)
+        rule_y = list_top - 22
+        pygame.draw.line(window, SEPERATE_LINE_COLOR, (list_left, rule_y),
+                         (list_left + list_width, rule_y), width=2)
+        # The rule lights up on the beat, so the whole header keeps the tempo.
+        glow = pygame.Surface((list_width, 2), pygame.SRCALPHA)
+        glow.fill((*ACCENT_COLOR, int(150 * pulse)))
+        window.blit(glow, (list_left, rule_y - 1))
 
         window.set_clip(clip)
         for i, chart in enumerate(charts):
             top = list_top + int((i - scroll) * SELECT_ROW_HEIGHT)
             if top + SELECT_ROW_HEIGHT < list_top or top > clip.bottom:
                 continue
-            draw_song_row(window, chart, pygame.Rect(list_left, top, list_width, SELECT_ROW_HEIGHT - 8), i == index)
+            draw_song_row(window, chart, pygame.Rect(list_left, top, list_width, SELECT_ROW_HEIGHT - 8),
+                          i == index, pulse)
         window.set_clip(None)
 
         draw_footer(window, "↑ ↓  선택      ENTER  시작      ESC  종료")
