@@ -4,8 +4,6 @@ import time
 import json
 import math
 import os
-import cv2
-import mediapipe as mp
 import pygame
 
 import dx
