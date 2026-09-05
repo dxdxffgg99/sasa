@@ -67,17 +67,25 @@ def align(chart, rate, verbose=True):
     """Best shift and time scale for this chart against the song at `rate`."""
     y, got = decode(chart["audio"], rate)
     envelope, hop = onset_envelope(y, got)
-    times = [t - chart["lead_in"] for t in chart["time"]]
+    # Where each note lands in the song as the game will judge it: the game hits
+    # a note when music_pos + lead_in + offset reaches its time, so an offset the
+    # chart already carries has to come out here or a fixed chart still reads bad.
+    times = [t - chart["lead_in"] - chart["offset"] for t in chart["time"]]
     beat_ms = 60000 / (chart["bpm"] or 120)
     limit = min(max(beat_ms * MAX_SHIFT_BEATS, SHIFT_CLAMP_MS[0]), SHIFT_CLAMP_MS[1])
-    shifts = np.arange(-limit, limit + HOP_MS, HOP_MS)
+    # Step out from zero rather than up from -limit, so "no change at all" is
+    # always one of the candidates and the search can never score below it.
+    steps = int(limit // HOP_MS)
+    shifts = np.arange(-steps, steps + 1) * HOP_MS
 
-    best = max(
-        ((score(envelope, hop, got, times, shift, scale), shift, scale)
-         for scale in SCALES for shift in shifts),
-        key=lambda item: item[0],
-    )
+    grid = [(score(envelope, hop, got, times, shift, scale), shift, scale)
+            for scale in SCALES for shift in shifts]
+    best = max(grid, key=lambda item: item[0])
     plain = score(envelope, hop, got, times, 0, 1.0)
+    # How far the shift can move before the score drops off tells us whether the
+    # peak is sharp enough to trust. A flat chart gives a wide, weak answer.
+    near = [shift for value, shift, _ in grid if value >= best[0] * 0.9]
+    band = (min(near), max(near)) if near else (best[1], best[1])
     # Control: the same number of notes scattered at random. The metric only
     # means something if a real chart beats this by a wide margin.
     rng = np.random.default_rng(0)
@@ -85,11 +93,13 @@ def align(chart, rate, verbose=True):
         score(envelope, hop, got, rng.uniform(0, max(times), len(times)), 0, 1.0)
         for _ in range(20)]))
     result = dict(rate=got, plain=plain, best=best[0], shift=best[1], scale=best[2],
-                  control=control, span=max(times))
+                  control=control, span=max(times), band=band)
     if verbose:
         print(f"  믹서 {got:>5} Hz | 그대로 {plain:+.3f} | 최적 {best[0]:+.3f} "
               f"@ shift {best[1]:+.0f} ms, scale {best[2]:.5f} "
               f"(곡 끝 {(best[2] - 1) * max(times):+.0f} ms) | 무작위 대조 {control:+.3f}")
+        print(f"        shift 신뢰구간 {band[0]:+.0f} ~ {band[1]:+.0f} ms "
+              f"(최고점의 90% 이상인 범위)")
     return result
 
 
@@ -128,8 +138,16 @@ def main():
     print(f"  -> 이 채보는 {winner['rate']} Hz 믹서 기준으로 만들어졌습니다 "
           f"(그 위에서 scale {winner['scale']:.5f}, 즉 배속 어긋남 없음)")
     print(f"     sample_rate: {winner['rate']}  를 헤더에 넣으세요")
-    if abs(winner["shift"]) >= HOP_MS:
-        print(f"     offset: {int(round(-winner['shift']))}  를 넣으면 판정이 맞습니다")
+    low, high = winner["band"]
+    if low <= 0 <= high:
+        print(f"     offset {chart['offset']} 은 신뢰구간 안에 있습니다 — 그대로 두세요")
+    elif abs(winner["shift"]) >= HOP_MS:
+        print(f"     offset: {int(round(chart['offset'] - winner['shift']))}  "
+              f"를 넣으면 판정이 맞습니다 (현재 {chart['offset']})")
+    else:
+        print(f"     offset {chart['offset']} 은 이미 맞습니다")
+    if high - low > 60:
+        print(f"     (봉우리가 평평해서 offset 추정은 참고만 하세요)")
     if abs(drift) > 40:
         print(f"     그 위에서도 곡 끝까지 {drift:+.0f} ms 가 남습니다")
     return 0
