@@ -13,10 +13,16 @@ pygame.mixer.pre_init(44100, -16, 2, 512)
 pygame.init()
 
 INFO = pygame.display.Info()
-BORDERLESS = True
+# Windows and macOS put a title bar on every window and expect it to be there:
+# without one there is no way to drag the window or close it but the keyboard.
+# The borderless look came from Linux, so that is where it stays.
+BORDERLESS = sys.platform.startswith("linux")
 FULLSCREEN = False
+# A bordered window has to leave room for its own title bar on top of the space
+# the taskbar already takes, or the bottom of the playfield falls off the screen.
+SCREEN_MARGIN = 50 if BORDERLESS else 100
 WIDTH = 768
-HEIGHT = INFO.current_h if FULLSCREEN else INFO.current_h-50
+HEIGHT = INFO.current_h if FULLSCREEN else INFO.current_h - SCREEN_MARGIN
 SIDE_PANEL_WIDTH = 260
 GAME_CAPTION = "sasa rhythm"
 LANE_COUNT = 4
