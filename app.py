@@ -62,9 +62,14 @@ MISSED_NOTE_COLOR = (110, 110, 120)
 
 SYNC = 0
 SCORE_P = 1
-SIGMA_EARLY = 60.0
-SIGMA_LATE = 40.0
-GOOD_WINDOW = 40
+# One knob for how forgiving the timing is: every window below is written at
+# scale 1.0 and multiplied by this, so raising it loosens judgement across the
+# board and lowering it tightens. The early side is wider than the late side
+# because arriving before the beat reads as less of a mistake than dragging.
+JUDGE_SCALE = 1.25
+SIGMA_EARLY = 60.0 * JUDGE_SCALE
+SIGMA_LATE = 40.0 * JUDGE_SCALE
+GOOD_WINDOW = int(40 * JUDGE_SCALE)
 THRESHOLD_MARVELOUS = 0.99
 THRESHOLD_PERFECT = 0.85
 THRESHOLD_GREAT = 0.75
