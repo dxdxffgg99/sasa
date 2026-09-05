@@ -9,11 +9,12 @@ brightness (spectral centroid) of each hit.
 """
 
 import argparse
-import json
 import os
 
 import librosa
 import numpy as np
+
+import dx
 
 LANE_COUNT = 4
 MIXER_RATE = 44100  # must match the mixer app.py opens
@@ -181,22 +182,29 @@ def make_chart(path, difficulty, offset, lead_in, holds=True):
         lengths = [0] * len(times)
 
     note_ms = [int(round(t * 1000)) + lead_in for t in times]
-    return {
+    chart = dict(dx.DEFAULTS)
+    chart.update({
+        "title": os.path.splitext(os.path.basename(path))[0],
         "audio": os.path.basename(path),
         "bpm": round(tempo, 2),
         "offset": offset,
         "lead_in": lead_in,
+        "difficulty": difficulty.upper(),
         "note": [int(l) + 1 for l in lanes],
         "time": note_ms,
         "len": lengths,
-    }
+    })
+    return chart
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate a sasa chart from audio.")
     parser.add_argument("audio", help="path to the song (mp3/wav/ogg/flac)")
     parser.add_argument("-d", "--difficulty", choices=DIFFICULTIES, default="normal")
-    parser.add_argument("-o", "--output", default="game.json")
+    parser.add_argument("-o", "--output", help="chart to write (default: the song's name with .dx)")
+    parser.add_argument("--title", help="song name shown on the select screen")
+    parser.add_argument("--artist", default="")
+    parser.add_argument("--level", type=int, default=0, help="difficulty number, 0 to leave it off")
     parser.add_argument("--offset", type=int, default=0,
                         help="ms to shift judgement if the song feels early/late")
     parser.add_argument("--lead-in", type=int, default=2000,
@@ -206,12 +214,17 @@ def main():
     args = parser.parse_args()
 
     chart = make_chart(args.audio, args.difficulty, args.offset, args.lead_in, args.holds)
-    with open(args.output, "w", encoding="utf-8") as file:
-        json.dump(chart, file, indent=4)
+    if args.title:
+        chart["title"] = args.title
+    chart["artist"] = args.artist
+    chart["level"] = args.level
+
+    output = args.output or os.path.splitext(args.audio)[0] + ".dx"
+    dx.dump(chart, output)
 
     density = len(chart["note"]) / (max(chart["time"]) / 1000) if chart["time"] else 0
     holds = sum(1 for l in chart["len"] if l)
-    print(f"wrote {args.output}: {len(chart['note'])} notes ({holds} long), {density:.1f} notes/sec")
+    print(f"wrote {output}: {len(chart['note'])} notes ({holds} long), {density:.1f} notes/sec")
 
 
 if __name__ == "__main__":
