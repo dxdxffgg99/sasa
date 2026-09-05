@@ -2,6 +2,7 @@ title: R
 audio: R.mp3
 bpm: 89.1
 lead_in: 2000
+sample_rate: 44100
 difficulty: NORMAL
 level: 5
 beats_per_measure: 4

@@ -14,10 +14,11 @@ import os
 import librosa
 import numpy as np
 
+import audio
 import dx
 
 LANE_COUNT = 4
-MIXER_RATE = 44100  # must match the mixer app.py opens
+FALLBACK_MIXER_RATE = 44100  # only for audio whose own rate cannot be read
 
 # subdivisions per beat, minimum gap between notes (ms), onset strength percentile
 DIFFICULTIES = {
@@ -58,22 +59,32 @@ def snap_to_grid(onsets, beats, subdivision):
 def load_audio(path, sr):
     """Decode through the same path the game plays through, resampled for analysis.
 
-    SDL's MP3 decode runs about 0.13% shorter than librosa's, which is 200 ms of
-    drift by the end of a two-and-a-half minute song -- wider than the hit window.
-    Analysing what actually gets played keeps the chart aligned by construction.
+    Returns the audio and the mixer rate it came through, which the chart records
+    so the game can open its mixer the same way.
+
+    The mixer resamples anything that does not match the rate it was opened at,
+    and SDL's resampler is not length-preserving: a 48 kHz song through a 44.1 kHz
+    mixer comes out 0.129% short, which is 190 ms by the end of a two-and-a-half
+    minute song -- far wider than the 40 ms hit window. Opening at the file's own
+    rate keeps the decode sample-exact, and analysing that same decode keeps the
+    chart aligned with what the player will actually hear.
     """
+    mixer_rate = audio.native_rate(path) or FALLBACK_MIXER_RATE
     try:
         import pygame
-        pygame.mixer.init(MIXER_RATE, -16, 2, 512)
+        pygame.mixer.init(mixer_rate, -16, 2, 512)
+        mixer_rate = pygame.mixer.get_init()[0]  # the device may not grant the ask
         y = pygame.sndarray.array(pygame.mixer.Sound(path)).astype(np.float32)
         pygame.mixer.quit()
         if y.ndim > 1:
             y = y.mean(axis=1)
         y /= np.max(np.abs(y)) or 1
-        return librosa.resample(y, orig_sr=MIXER_RATE, target_sr=sr)
+        print(f"  decoded through a {mixer_rate} Hz mixer")
+        return librosa.resample(y, orig_sr=mixer_rate, target_sr=sr), mixer_rate
     except Exception as e:
         print(f"  playback decode unavailable ({e}), falling back to librosa")
-        return librosa.load(path, sr=sr, mono=True)[0]
+        print("  the chart may drift against the song; see README")
+        return librosa.load(path, sr=sr, mono=True)[0], 0
 
 
 def detect_onsets(onset_env, sr, duration):
@@ -144,7 +155,7 @@ def make_chart(path, difficulty, offset, lead_in, holds=True):
 
     print(f"loading {path} ...")
     sr = 22050
-    y = load_audio(path, sr)
+    y, mixer_rate = load_audio(path, sr)
     duration = len(y) / sr
 
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
@@ -190,6 +201,7 @@ def make_chart(path, difficulty, offset, lead_in, holds=True):
         "offset": offset,
         "lead_in": lead_in,
         "difficulty": difficulty.upper(),
+        "sample_rate": mixer_rate,
         "note": [int(l) + 1 for l in lanes],
         "time": note_ms,
         "len": lengths,

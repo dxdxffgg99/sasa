@@ -2,6 +2,7 @@ title: Pixelation
 audio: pixelation.mp3
 bpm: 129.2
 lead_in: 2000
+sample_rate: 44100
 difficulty: NORMAL
 level: 6
 beats_per_measure: 4

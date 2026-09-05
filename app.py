@@ -6,6 +6,7 @@ import math
 import os
 import pygame
 
+import audio
 import dx
 
 pygame.mixer.pre_init(44100, -16, 2, 512)
@@ -83,6 +84,9 @@ SELECT_SCROLL_SPEED = 0.22  # fraction of the remaining distance eaten per frame
 ACCENT_COLOR = (120, 190, 255)
 DIM_TEXT_COLOR = (140, 150, 185)
 END_HANG_TIME = 1500  # ms of empty playfield before the results come up
+DEFAULT_MIXER_RATE = 44100
+DRIFT_WARN = 0.0002  # fractional drift worth telling the player about (0.02%)
+MIN_HITS_FOR_DRIFT = 20
 
 if FULLSCREEN:
     WINDOW_WIDTH, WINDOW_HEIGHT = INFO.current_w, INFO.current_h
@@ -328,6 +332,29 @@ def results_screen(chart, results):
         clock.tick(60)
 
 
+def open_mixer_for(path, declared_rate=0):
+    """Re-open the mixer at the song's own sample rate.
+
+    Whatever the mixer is opened at, SDL resamples everything else to it, and
+    that resampler loses length: a 48 kHz song through a 44.1 kHz mixer runs
+    0.129% short, so the song ends 190 ms before the chart thinks it does. The
+    chart records the rate it was built against; failing that we read the file.
+    """
+    wanted = declared_rate or audio.native_rate(path) or DEFAULT_MIXER_RATE
+    current = pygame.mixer.get_init()
+    if current and current[0] == wanted:
+        return
+    try:
+        pygame.mixer.quit()
+        pygame.mixer.init(wanted, -16, 2, 512)
+    except pygame.error as error:
+        print(f"could not open the mixer at {wanted} Hz ({error}); notes may drift")
+        pygame.mixer.init()
+    got = pygame.mixer.get_init()
+    if got and got[0] != wanted:
+        print(f"mixer opened at {got[0]} Hz, not {wanted} Hz; notes may drift")
+
+
 def note_y(note_time, now):
     """Screen height a note of that timestamp sits at right now."""
     return JUDGE_LINE_HEIGHT * (1 - (note_time - now) / NOTE_FALL_TIME)
@@ -365,20 +392,53 @@ def rate(error):
     return "MISS"
 
 
-def offset_advice(hit_errors, sync_offset):
-    """What the player's own timing says the chart's offset should have been."""
-    if len(hit_errors) < 10:
+def median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def measure_drift(hits):
+    """Fractional drift between chart and song, from how the error grows.
+
+    A constant lateness is just an offset. Error that *grows* through the song
+    means the two timelines run at different speeds -- almost always the mixer
+    resampling the song to a rate it was not encoded at. Comparing the median
+    error of the first half against the second half gives the slope without
+    letting a few fumbled notes tilt it.
+    """
+    if len(hits) < MIN_HITS_FOR_DRIFT:
+        return None
+    half = len(hits) // 2
+    early, late = hits[:half], hits[half:]
+    span = median([t for t, _ in late]) - median([t for t, _ in early])
+    if span <= 0:
+        return None
+    return (median([e for _, e in late]) - median([e for _, e in early])) / span
+
+
+def offset_advice(hits, sync_offset, song_ms):
+    """What the player's own timing says about the chart's alignment."""
+    if len(hits) < 10:
         return ["10노트 이상 쳐야 오프셋을 추천할 수 있어요"]
-    ordered = sorted(hit_errors)
-    median = ordered[len(ordered) // 2]
-    average = sum(ordered) / len(ordered)
-    print(f"hits: {len(ordered)}  median error: {median:+d} ms  average: {average:+.1f} ms")
-    print(f"suggested offset: {sync_offset - median} (currently {sync_offset})")
+
+    errors = [error for _, error in hits]
+    middle = median(errors)
+    average = sum(errors) / len(errors)
+    print(f"hits: {len(errors)}  median error: {middle:+d} ms  average: {average:+.1f} ms")
+    print(f"suggested offset: {sync_offset - middle} (currently {sync_offset})")
     print("positive error means you pressed late, so the notes were arriving early")
-    return [
-        f"판정 오차 중앙값 {median:+d} ms (평균 {average:+.1f} ms)",
-        f"추천 offset: {sync_offset - median}  (현재 {sync_offset})",
+    lines = [
+        f"판정 오차 중앙값 {middle:+d} ms (평균 {average:+.1f} ms)",
+        f"추천 offset: {sync_offset - middle}  (현재 {sync_offset})",
     ]
+
+    drift = measure_drift(hits)
+    if drift is not None and abs(drift) > DRIFT_WARN:
+        total = drift * song_ms
+        print(f"drift: {drift * 100:+.3f}% ({total:+.0f} ms across the song)")
+        lines.append(f"곡이 갈수록 {drift * 100:+.3f}% 밀림 (끝까지 {total:+.0f} ms)")
+        lines.append("offset으로는 못 고쳐요 — 믹서 샘플레이트가 곡과 다릅니다")
+    return lines
 
 
 def play(chart):
@@ -388,16 +448,17 @@ def play(chart):
         {"lane": lane - 1, "time": hit_time, "len": hold_len, "state": "wait"}
         for lane, hit_time, hold_len in zip(chart["note"], chart["time"], chart["len"])
     ]
-    audio = chart["audio"]
+    song = chart["audio"]
     lead_in = chart["lead_in"]
     sync_offset = chart["offset"]  # raise this if the notes arrive later than the song
 
-    if audio:
+    if song:
+        open_mixer_for(song, chart["sample_rate"])
         try:
-            pygame.mixer.music.load(audio)
+            pygame.mixer.music.load(song)
         except pygame.error as error:
             print(f"audio load failed: {error}")
-            audio = None
+            song = None
 
     lane_alpha = [0] * LANE_COUNT
     spark_time = [-SPARK_TIME] * LANE_COUNT
@@ -469,7 +530,7 @@ def play(chart):
     while True:
         elapsed = pygame.time.get_ticks() - start_ticks
 
-        if audio and not music_started and elapsed >= lead_in:
+        if song and not music_started and elapsed >= lead_in:
             pygame.mixer.music.play()
             music_started = True
 
@@ -492,13 +553,13 @@ def play(chart):
                     lane_alpha[lane] = ANIMATION_INIT_ALPHA
                     result, error = press_lane(lane, now)
                     if result == "MISS":
-                        hit_errors.append(error)
+                        hit_errors.append((now, error))
                         combo = 0
                         judge_text = "MISS"
                         judge_time = now
                         record_judge(result, now, error)
                     elif result is not None:
-                        hit_errors.append(error)
+                        hit_errors.append((now, error))
                         combo += 1
                         max_combo = max(max_combo, combo)
                         combo_time = now
@@ -693,7 +754,8 @@ def play(chart):
         "counts": counts,
         "max_combo": max_combo,
         "accuracy": 100 * accuracy_sum / judged if judged else 0.0,
-        "advice": offset_advice(hit_errors, sync_offset),
+        "advice": offset_advice(hit_errors, sync_offset,
+                                max(chart["time"]) - lead_in if chart["time"] else 0),
     }
     return status, results
 

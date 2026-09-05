@@ -38,6 +38,7 @@ DEFAULTS = {
     "difficulty": "",
     "level": 0,
     "beats_per_measure": 4,
+    "sample_rate": 0,
 }
 # Header keys are typo-checked against this, so a misspelling fails loudly
 # instead of silently charting at the default tempo.
@@ -51,6 +52,7 @@ HEADER_TYPES = {
     "difficulty": str,
     "level": int,
     "beats_per_measure": int,
+    "sample_rate": int,
 }
 
 
