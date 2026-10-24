@@ -148,7 +148,7 @@ def song_select(charts, index=0):
         c.window.blit(assets.menu_background, (0, 0))
         draw_menu_notes(c.window, notes, c.clock.get_time() / 1000)
 
-        heading = c.heading_font.render("sasa", True, (255, 255, 255))
+        heading = c.heading_font.render("MOLA", True, (255, 255, 255))
         c.window.blit(heading, (list_left, 74))
         count = c.meta_font.render(f"{len(charts)}곡", True, c.DIM_TEXT_COLOR)
         c.window.blit(count, count.get_rect(bottomright=(list_left + list_width, 74 + heading.get_height() - 6)))
